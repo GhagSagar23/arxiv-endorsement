@@ -67,35 +67,39 @@ def test_wrong_subject_pr_is_answered_only_once(stubbed, monkeypatch):
     assert stubbed["comments"] == []
 
 
-def test_completion_prefers_sonnet_and_falls_back(monkeypatch, tmp_path):
-    sonnet = tmp_path / "claude-sonnet-5-completions.py"
-    fallback = tmp_path / "best-effort-completions.py"
-    for p in (sonnet, fallback):
-        p.write_text("")
-    monkeypatch.setattr(review_prs, "COMPLETION_BACKENDS", (sonnet, fallback))
+class _Proc:
+    def __init__(self, code, out):
+        self.returncode, self.stdout, self.stderr = code, out, ""
 
-    tried: list[str] = []
 
-    class Proc:
-        def __init__(self, code, out):
-            self.returncode, self.stdout, self.stderr = code, out, ""
+def test_completion_uses_best_effort_medium_tier(monkeypatch, tmp_path):
+    backend = tmp_path / "best-effort-completions.py"
+    backend.write_text("")
+    monkeypatch.setattr(review_prs, "COMPLETION_BACKEND", backend)
+
+    calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
-        name = Path(cmd[1]).name
-        tried.append(name)
-        if name.startswith("claude-sonnet"):
-            return Proc(1, "")  # e.g. 429 out of credits
-        return Proc(0, '{"model": "claude-haiku-4-5", "choices": []}')
+        calls.append(cmd[1:])
+        return _Proc(0, '{"model": "x", "best_effort": {"model": "claude-sonnet-5-5"}, "choices": []}')
 
     monkeypatch.setattr(review_prs.subprocess, "run", fake_run)
-    response = review_prs.best_effort_completion({"messages": []})
-    assert tried == ["claude-sonnet-5-completions.py", "best-effort-completions.py"]
-    assert response["model"] == "claude-haiku-4-5"
-    assert "claude-haiku-4-5" in review_prs._MODELS_USED
+    review_prs.best_effort_completion({"messages": []})
+    assert calls == [[str(backend), "--tier", "medium"]]
+    assert "claude-sonnet-5-5" in review_prs._MODELS_USED
 
 
-def test_completion_raises_when_every_backend_fails(monkeypatch, tmp_path):
-    monkeypatch.setattr(review_prs, "COMPLETION_BACKENDS", (tmp_path / "missing.py",))
+def test_completion_raises_when_backend_fails(monkeypatch, tmp_path):
+    backend = tmp_path / "best-effort-completions.py"
+    backend.write_text("")
+    monkeypatch.setattr(review_prs, "COMPLETION_BACKEND", backend)
+    monkeypatch.setattr(review_prs.subprocess, "run", lambda cmd, **kw: _Proc(75, '{"error": {}}'))
+    with pytest.raises(RuntimeError, match="no completion backend succeeded"):
+        review_prs.best_effort_completion({"messages": []})
+
+
+def test_completion_raises_when_backend_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(review_prs, "COMPLETION_BACKEND", tmp_path / "missing.py")
     with pytest.raises(RuntimeError, match="no completion backend succeeded"):
         review_prs.best_effort_completion({"messages": []})
 

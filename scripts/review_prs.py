@@ -26,13 +26,11 @@ DEFAULT_REPO = "monperrus/arxiv-endorsement"
 COMMENT_MARKER = "<!-- arxiv-endorsement-check -->"
 WRONG_SUBJECT_MARKER = "<!-- arxiv-endorsement-wrong-subject -->"
 WRONG_SUBJECT_MESSAGE = "[automated reply] we only endorse for cs.SE"
-# Sonnet 5 first: best-effort-completions.py starts with Haiku, whose gate verdicts
-# proved unstable across identical runs (same PDF checksum, opposite overall verdict).
-# best-effort stays as the fallback for when the Sonnet endpoint is out of credits.
-COMPLETION_BACKENDS = (
-    Path.home() / "bin" / "claude-sonnet-5-completions.py",
-    Path.home() / "bin" / "best-effort-completions.py",
-)
+# Tier medium, not the default low: low-tier models (e.g. Haiku) gave gate verdicts
+# that proved unstable across identical runs (same PDF checksum, opposite verdict).
+# best-effort-completions.py handles the fallback across backends within the tier.
+COMPLETION_BACKEND = Path.home() / "bin" / "best-effort-completions.py"
+COMPLETION_TIER = "medium"
 # Agent launchers (agentknit one-shot tasks on stdin). Each maps to a model name
 # reported in the posted check comment.
 AGENT_SCRIPTS = {
@@ -167,29 +165,26 @@ def make_completion(agent: str):
 
 
 def best_effort_completion(payload: dict) -> dict:
-    """Complete a payload with the first backend that answers, Sonnet 5 first."""
+    """Complete a payload with best-effort-completions.py at COMPLETION_TIER."""
     global _LAST_MODEL
-    errors = []
-    for backend in COMPLETION_BACKENDS:
-        if not backend.exists():
-            errors.append(f"{backend.name}: not found")
-            continue
-        proc = subprocess.run(
-            [sys.executable, str(backend)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
+    backend = COMPLETION_BACKEND
+    if not backend.exists():
+        raise RuntimeError(f"no completion backend succeeded: {backend.name}: not found")
+    proc = subprocess.run(
+        [sys.executable, str(backend), "--tier", COMPLETION_TIER],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"no completion backend succeeded: {backend.name}: {(proc.stderr or proc.stdout).strip()[:500]}"
         )
-        if proc.returncode != 0:
-            errors.append(f"{backend.name}: {(proc.stderr or proc.stdout).strip()[:200]}")
-            print(f"  {backend.name} failed, trying next backend", file=sys.stderr)
-            continue
-        response = json.loads(proc.stdout)
-        _LAST_MODEL = response.get("best_effort", {}).get("model") or response.get("model") or _LAST_MODEL
-        if _LAST_MODEL not in _MODELS_USED:
-            _MODELS_USED.append(_LAST_MODEL)
-        return response
-    raise RuntimeError("no completion backend succeeded: " + "; ".join(errors))
+    response = json.loads(proc.stdout)
+    _LAST_MODEL = response.get("best_effort", {}).get("model") or response.get("model") or _LAST_MODEL
+    if _LAST_MODEL not in _MODELS_USED:
+        _MODELS_USED.append(_LAST_MODEL)
+    return response
 
 
 def evaluate_paper(text: str, complete=best_effort_completion) -> tuple[dict, str]:
