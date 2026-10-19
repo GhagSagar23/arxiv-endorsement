@@ -4,7 +4,8 @@
 A request PR is "valid" when its requests/*.txt file passes scripts/validate_request_files.py.
 Skips PRs that already carry a check comment (idempotent). A request for a subject other
 than cs.SE is answered and closed. A checked PR with at least one failing gate and no
-activity for AUTOCLOSE_AFTER is closed, unless --update is given.
+activity for AUTOCLOSE_AFTER is closed, unless --update is given or the author replied
+after the check. All model calls for one PR go to one model (see best_effort_completion).
 
 Usage:
   ./scripts/review_prs.py [--repo owner/repo] [--dry-run] [--pr N] [--agent claude|kimi-k3]
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import importlib.util
 import json
 import re
@@ -71,7 +73,7 @@ def gh_json(*args: str):
 def list_open_prs(repo: str) -> list[dict]:
     return gh_json(
         "pr", "list", "--repo", repo, "--state", "open",
-        "--json", "number,url,files,headRefOid,updatedAt",
+        "--json", "number,url,files,headRefOid,updatedAt,author",
     )
 
 
@@ -109,6 +111,22 @@ def is_stale_failing(pr: dict, check_comment: dict, now: datetime) -> bool:
     return now - updated >= AUTOCLOSE_AFTER
 
 
+def author_replied_since_check(repo: str, pr_number: int, author: str) -> bool:
+    """True when the PR author commented after the check comment was last posted or edited.
+
+    Such a PR waits on us (e.g. the author fixed the repository and asked for a re-check),
+    so it is never autoclosed.
+    """
+    proc = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr_number}/comments",
+         "--jq", ".[] | {login: .user.login, created_at, updated_at, body}"],
+        capture_output=True, text=True, check=True,
+    )
+    comments = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    checked_at = max((c["updated_at"] for c in comments if COMMENT_MARKER in c["body"]), default="")
+    return any(c["login"] == author and c["created_at"] > checked_at for c in comments)
+
+
 def parse_fields(text: str) -> dict[str, str]:
     fields = {}
     for line in text.splitlines():
@@ -118,9 +136,13 @@ def parse_fields(text: str) -> dict[str, str]:
 
 
 _LAST_MODEL = "unknown"
-# Every model that answered while reviewing the current PR; a gate that fell back to
-# another backend must be visible in the posted comment.
+# Every model that answered while reviewing the current PR. All calls go to the pinned
+# model, so this holds one name unless the pinned model failed and the tier picked
+# another one, which must then be visible in the posted comment.
 _MODELS_USED: list[str] = []
+# best-effort-completions.py `--model` name of the model the current PR is pinned to:
+# the tier picks it at random on the first call, later calls ask for it by name.
+_PINNED_MODEL: str | None = None
 
 
 def format_messages(messages: list[dict]) -> str:
@@ -178,23 +200,52 @@ def make_completion(agent: str):
     return lambda payload: agent_completion(payload, script, model_name)
 
 
+@functools.cache
+def backend_model_names() -> dict[str, str]:
+    """Map each best-effort-completions.py backend entry to its `--model` name."""
+    backend_dir = str(COMPLETION_BACKEND.resolve().parent)
+    sys.path.insert(0, backend_dir)  # it imports its sibling _quota
+    try:
+        module = load_module(COMPLETION_BACKEND, "best_effort_completions")
+    finally:
+        sys.path.remove(backend_dir)
+    return {script: name for name, script in module.MODELS.items()}
+
+
 def best_effort_completion(payload: dict) -> dict:
-    """Complete a payload with best-effort-completions.py at COMPLETION_TIER."""
-    global _LAST_MODEL
+    """Complete a payload with best-effort-completions.py, pinned to one model per PR.
+
+    The first call of a PR lets COMPLETION_TIER pick a model, later calls pin it with
+    `--model`; if the pinned model fails, the tier picks again and the pin moves.
+    """
+    global _LAST_MODEL, _PINNED_MODEL
     backend = COMPLETION_BACKEND
     if not backend.exists():
         raise RuntimeError(f"no completion backend succeeded: {backend.name}: not found")
-    proc = subprocess.run(
-        [sys.executable, str(backend), "--tier", COMPLETION_TIER],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-    )
+
+    def run(*selector: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(backend), *selector],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+
+    proc = None
+    if _PINNED_MODEL is not None:
+        proc = run("--model", _PINNED_MODEL)
+        if proc.returncode != 0:
+            print(f"  pinned model {_PINNED_MODEL} failed, falling back to the {COMPLETION_TIER} tier", file=sys.stderr)
+    if proc is None or proc.returncode != 0:
+        proc = run("--tier", COMPLETION_TIER)
     if proc.returncode != 0:
         raise RuntimeError(
             f"no completion backend succeeded: {backend.name}: {(proc.stderr or proc.stdout).strip()[:500]}"
         )
     response = json.loads(proc.stdout)
+    answered_by = response.get("best_effort", {}).get("backend")
+    if answered_by:
+        _PINNED_MODEL = backend_model_names().get(answered_by, _PINNED_MODEL)
     _LAST_MODEL = response.get("best_effort", {}).get("model") or response.get("model") or _LAST_MODEL
     if _LAST_MODEL not in _MODELS_USED:
         _MODELS_USED.append(_LAST_MODEL)
@@ -305,7 +356,11 @@ def process_pr(
 
     existing_comment = find_comment(repo, number)
     # --update is an explicit request to re-check, so it never autocloses.
-    if existing_comment and not update and is_stale_failing(pr, existing_comment, now or datetime.now(timezone.utc)):
+    if (
+        existing_comment and not update
+        and is_stale_failing(pr, existing_comment, now or datetime.now(timezone.utc))
+        and not author_replied_since_check(repo, number, pr["author"]["login"])
+    ):
         body = f"{AUTOCLOSE_MARKER}\n{AUTOCLOSE_MESSAGE}"
         if dry_run:
             print(f"\n--- PR #{number} (dry run, not closed) ---\n{body}\n")
@@ -356,7 +411,9 @@ def process_pr(
         return
 
     checksum = check_paper.sha256_file(str(tmp_pdf))
+    global _PINNED_MODEL
     _MODELS_USED.clear()
+    _PINNED_MODEL = None
     try:
         text = check_paper.pdf_to_text(str(tmp_pdf))
         result, _ = evaluate_paper(text, complete)

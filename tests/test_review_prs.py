@@ -22,7 +22,7 @@ review_prs = _load(ROOT / "scripts" / "review_prs.py", "review_prs")
 WRONG_SUBJECT = "LinkedIn: https://www.linkedin.com/in/someone\nPaper: https://example.org/p.pdf\nRepo: https://github.com/someone/repo\nSubject: cs.AI\nEndorsementCode: A1B2C3\n"
 MALFORMED = "LinkedIn: https://www.linkedin.com/in/someone\nSubject: cs.SE\n"
 
-PR = {"number": 42, "files": [{"path": "requests/someone.txt"}], "headRefOid": "deadbeef"}
+PR = {"number": 42, "files": [{"path": "requests/someone.txt"}], "headRefOid": "deadbeef", "author": {"login": "someone"}}
 
 
 @pytest.fixture
@@ -31,6 +31,7 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(review_prs, "post_comment", lambda repo, n, body: calls["comments"].append((n, body)))
     monkeypatch.setattr(review_prs, "already_commented", lambda repo, n, marker=review_prs.COMMENT_MARKER: False)
     monkeypatch.setattr(review_prs, "find_comment", lambda repo, n, marker=review_prs.COMMENT_MARKER: None)
+    monkeypatch.setattr(review_prs, "author_replied_since_check", lambda repo, n, author: False)
 
     def fake_close(repo, n, body):
         calls["comments"].append((n, body))
@@ -84,9 +85,58 @@ def test_completion_uses_best_effort_medium_tier(monkeypatch, tmp_path):
         return _Proc(0, '{"model": "x", "best_effort": {"model": "claude-sonnet-5-5"}, "choices": []}')
 
     monkeypatch.setattr(review_prs.subprocess, "run", fake_run)
+    monkeypatch.setattr(review_prs, "_PINNED_MODEL", None)
     review_prs.best_effort_completion({"messages": []})
     assert calls == [[str(backend), "--tier", "medium"]]
     assert "claude-sonnet-5-5" in review_prs._MODELS_USED
+
+
+def test_completion_pins_the_first_model_for_later_calls(monkeypatch, tmp_path):
+    backend = tmp_path / "best-effort-completions.py"
+    backend.write_text("")
+    monkeypatch.setattr(review_prs, "COMPLETION_BACKEND", backend)
+    monkeypatch.setattr(review_prs, "_PINNED_MODEL", None)
+    monkeypatch.setattr(review_prs, "backend_model_names", lambda: {"cursor-composer-completions.py": "composer-2.5"})
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[2:])
+        return _Proc(0, '{"best_effort": {"backend": "cursor-composer-completions.py", "model": "composer-2.5"}}')
+
+    monkeypatch.setattr(review_prs.subprocess, "run", fake_run)
+    review_prs._MODELS_USED.clear()
+    review_prs.best_effort_completion({"messages": []})
+    review_prs.best_effort_completion({"messages": []})
+    assert calls == [["--tier", "medium"], ["--model", "composer-2.5"]]
+    assert review_prs._MODELS_USED == ["composer-2.5"]
+
+
+def test_completion_falls_back_to_the_tier_when_the_pinned_model_fails(monkeypatch, tmp_path):
+    backend = tmp_path / "best-effort-completions.py"
+    backend.write_text("")
+    monkeypatch.setattr(review_prs, "COMPLETION_BACKEND", backend)
+    monkeypatch.setattr(review_prs, "_PINNED_MODEL", "composer-2.5")
+    monkeypatch.setattr(review_prs, "backend_model_names", lambda: {"kimi-k3-completions.py": "kimi-k3"})
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[2:])
+        if "--model" in cmd:
+            return _Proc(1, "")
+        return _Proc(0, '{"best_effort": {"backend": "kimi-k3-completions.py", "model": "kimi-k3"}}')
+
+    monkeypatch.setattr(review_prs.subprocess, "run", fake_run)
+    review_prs.best_effort_completion({"messages": []})
+    assert calls == [["--model", "composer-2.5"], ["--tier", "medium"]]
+    assert review_prs._PINNED_MODEL == "kimi-k3"
+
+
+def test_backend_model_names_reads_the_real_backend():
+    if not review_prs.COMPLETION_BACKEND.exists():
+        pytest.skip("best-effort-completions.py not installed")
+    names = review_prs.backend_model_names()
+    assert names["cursor-composer-completions.py"] == "composer-2.5"
+    assert names["openai-completions.py --model gpt-5.6-terra"] == "gpt-5.6-terra"
 
 
 def test_completion_raises_when_backend_fails(monkeypatch, tmp_path):
@@ -246,6 +296,38 @@ def test_autoclose_is_not_applied_in_dry_run(stubbed, monkeypatch):
     review_prs.process_pr("owner/repo", _pr_updated(30), dry_run=True, update=False, now=NOW)
     assert stubbed["closed"] == []
     assert stubbed["comments"] == []
+
+
+def test_pr_is_not_autoclosed_when_the_author_replied(stubbed, monkeypatch):
+    monkeypatch.setattr(review_prs, "find_comment", lambda repo, n, marker=review_prs.COMMENT_MARKER: FAILING_CHECK)
+    monkeypatch.setattr(review_prs, "author_replied_since_check", lambda repo, n, author: author == "someone")
+    monkeypatch.setattr(review_prs, "fetch_file_content", lambda repo, path, ref: MALFORMED)
+    review_prs.process_pr("owner/repo", _pr_updated(30), dry_run=False, update=False, now=NOW)
+    assert stubbed["closed"] == []
+
+
+def _comments_api(monkeypatch, comments: list[dict]) -> None:
+    lines = "\n".join(review_prs.json.dumps(c) for c in comments)
+    monkeypatch.setattr(review_prs.subprocess, "run", lambda cmd, **kw: _Proc(0, lines))
+
+
+@pytest.mark.parametrize(
+    ("comments", "replied"),
+    [
+        # author asked for a re-check after our check comment
+        ([{"login": "bot", "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z", "body": review_prs.COMMENT_MARKER},
+          {"login": "someone", "created_at": "2026-10-02T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "body": "fixed"}], True),
+        # the check comment was re-edited (--update) after the author's reply
+        ([{"login": "bot", "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-03T00:00:00Z", "body": review_prs.COMMENT_MARKER},
+          {"login": "someone", "created_at": "2026-10-02T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "body": "fixed"}], False),
+        # someone else replied
+        ([{"login": "bot", "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z", "body": review_prs.COMMENT_MARKER},
+          {"login": "other", "created_at": "2026-10-02T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "body": "+1"}], False),
+    ],
+)
+def test_author_replied_since_check(monkeypatch, comments, replied):
+    _comments_api(monkeypatch, comments)
+    assert review_prs.author_replied_since_check("owner/repo", 42, "someone") is replied
 
 
 def test_update_never_autocloses(stubbed, monkeypatch):
