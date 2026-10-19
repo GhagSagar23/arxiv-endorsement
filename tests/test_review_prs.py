@@ -248,6 +248,13 @@ def test_autoclose_is_not_applied_in_dry_run(stubbed, monkeypatch):
     assert stubbed["comments"] == []
 
 
+def test_update_never_autocloses(stubbed, monkeypatch):
+    monkeypatch.setattr(review_prs, "find_comment", lambda repo, n, marker=review_prs.COMMENT_MARKER: FAILING_CHECK)
+    monkeypatch.setattr(review_prs, "fetch_file_content", lambda repo, path, ref: MALFORMED)
+    review_prs.process_pr("owner/repo", _pr_updated(30), dry_run=False, update=True, now=NOW)
+    assert stubbed["closed"] == []
+
+
 def _gate_result(verdict: bool = True) -> dict:
     return {
         key: {"verdict": verdict, "confidence": "high", "feedback": ""}

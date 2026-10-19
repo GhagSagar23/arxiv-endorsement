@@ -4,7 +4,7 @@
 A request PR is "valid" when its requests/*.txt file passes scripts/validate_request_files.py.
 Skips PRs that already carry a check comment (idempotent). A request for a subject other
 than cs.SE is answered and closed. A checked PR with at least one failing gate and no
-activity for AUTOCLOSE_AFTER is closed.
+activity for AUTOCLOSE_AFTER is closed, unless --update is given.
 
 Usage:
   ./scripts/review_prs.py [--repo owner/repo] [--dry-run] [--pr N] [--agent claude|kimi-k3]
@@ -304,7 +304,8 @@ def process_pr(
         return
 
     existing_comment = find_comment(repo, number)
-    if existing_comment and is_stale_failing(pr, existing_comment, now or datetime.now(timezone.utc)):
+    # --update is an explicit request to re-check, so it never autocloses.
+    if existing_comment and not update and is_stale_failing(pr, existing_comment, now or datetime.now(timezone.utc)):
         body = f"{AUTOCLOSE_MARKER}\n{AUTOCLOSE_MESSAGE}"
         if dry_run:
             print(f"\n--- PR #{number} (dry run, not closed) ---\n{body}\n")
