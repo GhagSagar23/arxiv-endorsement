@@ -215,6 +215,39 @@ def test_other_validation_errors_leave_the_pr_open(stubbed, monkeypatch):
     assert stubbed["comments"] == []
 
 
+NOW = review_prs.datetime(2026, 10, 19, tzinfo=review_prs.timezone.utc)
+FAILING_CHECK = {"body": f"{review_prs.COMMENT_MARKER}\n- ✓ PASS gate 1\n- ✗ FAIL gate 2", "url": "x#issuecomment-1"}
+PASSING_CHECK = {"body": f"{review_prs.COMMENT_MARKER}\n- ✓ PASS gate 1\n- ✓ PASS gate 2", "url": "x#issuecomment-1"}
+
+
+def _pr_updated(days_ago: int) -> dict:
+    updated = NOW - review_prs.timedelta(days=days_ago)
+    return {**PR, "updatedAt": updated.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+@pytest.mark.parametrize(
+    ("check", "days_ago", "closed"),
+    [(FAILING_CHECK, 15, True), (FAILING_CHECK, 14, True), (FAILING_CHECK, 13, False), (PASSING_CHECK, 30, False)],
+)
+def test_inactive_pr_with_a_failing_gate_is_autoclosed(stubbed, monkeypatch, check, days_ago, closed):
+    monkeypatch.setattr(review_prs, "find_comment", lambda repo, n, marker=review_prs.COMMENT_MARKER: check)
+    review_prs.process_pr("owner/repo", _pr_updated(days_ago), dry_run=False, update=False, now=NOW)
+    assert stubbed["closed"] == ([42] if closed else [])
+    if closed:
+        (_, body), = stubbed["comments"]
+        assert review_prs.AUTOCLOSE_MESSAGE in body
+        assert review_prs.AUTOCLOSE_MARKER in body
+    else:
+        assert stubbed["comments"] == []
+
+
+def test_autoclose_is_not_applied_in_dry_run(stubbed, monkeypatch):
+    monkeypatch.setattr(review_prs, "find_comment", lambda repo, n, marker=review_prs.COMMENT_MARKER: FAILING_CHECK)
+    review_prs.process_pr("owner/repo", _pr_updated(30), dry_run=True, update=False, now=NOW)
+    assert stubbed["closed"] == []
+    assert stubbed["comments"] == []
+
+
 def _gate_result(verdict: bool = True) -> dict:
     return {
         key: {"verdict": verdict, "confidence": "high", "feedback": ""}

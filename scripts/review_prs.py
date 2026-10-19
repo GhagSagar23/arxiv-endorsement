@@ -3,7 +3,8 @@
 
 A request PR is "valid" when its requests/*.txt file passes scripts/validate_request_files.py.
 Skips PRs that already carry a check comment (idempotent). A request for a subject other
-than cs.SE is answered and closed.
+than cs.SE is answered and closed. A checked PR with at least one failing gate and no
+activity for AUTOCLOSE_AFTER is closed.
 
 Usage:
   ./scripts/review_prs.py [--repo owner/repo] [--dry-run] [--pr N] [--agent claude|kimi-k3]
@@ -19,6 +20,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +28,10 @@ DEFAULT_REPO = "monperrus/arxiv-endorsement"
 COMMENT_MARKER = "<!-- arxiv-endorsement-check -->"
 WRONG_SUBJECT_MARKER = "<!-- arxiv-endorsement-wrong-subject -->"
 WRONG_SUBJECT_MESSAGE = "[automated reply] we only endorse for cs.SE"
+AUTOCLOSE_MARKER = "<!-- arxiv-endorsement-autoclose -->"
+AUTOCLOSE_MESSAGE = "autoclosing due to failing checks, thanks for your PR."
+AUTOCLOSE_AFTER = timedelta(weeks=2)
+GATE_FAIL_MARK = "✗ FAIL"
 # Tier medium, not the default low: low-tier models (e.g. Haiku) gave gate verdicts
 # that proved unstable across identical runs (same PDF checksum, opposite verdict).
 # best-effort-completions.py handles the fallback across backends within the tier.
@@ -65,7 +71,7 @@ def gh_json(*args: str):
 def list_open_prs(repo: str) -> list[dict]:
     return gh_json(
         "pr", "list", "--repo", repo, "--state", "open",
-        "--json", "number,url,files,headRefOid",
+        "--json", "number,url,files,headRefOid,updatedAt",
     )
 
 
@@ -93,6 +99,14 @@ def find_comment(repo: str, pr_number: int, marker: str = COMMENT_MARKER) -> dic
 def close_pr(repo: str, pr_number: int, body: str) -> None:
     post_comment(repo, pr_number, body)
     subprocess.run(["gh", "pr", "close", str(pr_number), "--repo", repo], check=True)
+
+
+def is_stale_failing(pr: dict, check_comment: dict, now: datetime) -> bool:
+    """True when the check comment reports a failing gate and the PR saw no activity for AUTOCLOSE_AFTER."""
+    if GATE_FAIL_MARK not in check_comment.get("body", ""):
+        return False
+    updated = datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))
+    return now - updated >= AUTOCLOSE_AFTER
 
 
 def parse_fields(text: str) -> dict[str, str]:
@@ -282,7 +296,7 @@ def edit_comment(repo: str, comment_id: str, body: str) -> None:
 def process_pr(
     repo: str, pr: dict, dry_run: bool, update: bool,
     skip_repo: bool = False, threshold: float = check_repo.DEFAULT_TRACEABILITY_THRESHOLD,
-    complete=best_effort_completion,
+    complete=best_effort_completion, now: datetime | None = None,
 ) -> None:
     number = pr["number"]
     txt_files = [f["path"] for f in pr["files"] if f["path"].startswith("requests/") and f["path"].endswith(".txt")]
@@ -290,6 +304,14 @@ def process_pr(
         return
 
     existing_comment = find_comment(repo, number)
+    if existing_comment and is_stale_failing(pr, existing_comment, now or datetime.now(timezone.utc)):
+        body = f"{AUTOCLOSE_MARKER}\n{AUTOCLOSE_MESSAGE}"
+        if dry_run:
+            print(f"\n--- PR #{number} (dry run, not closed) ---\n{body}\n")
+        else:
+            close_pr(repo, number, body)
+            print(f"PR #{number}: failing checks and inactive, closed", file=sys.stderr)
+        return
     if existing_comment and not update:
         print(f"PR #{number}: already checked, skipping", file=sys.stderr)
         return
