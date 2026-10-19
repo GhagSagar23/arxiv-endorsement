@@ -322,8 +322,18 @@ def value_patterns(value: str) -> list[re.Pattern]:
     return [re.compile(p) for p in pats]
 
 
+# Order in which hits are kept when a value appears in more than MAX_EVIDENCE_FILES
+# files: a common value (4, 30, 55.0) would otherwise fill the slots with whatever
+# docs and scripts come first in path order and hide the data file that backs it.
+EVIDENCE_KIND_RANK = {"data": 0, "script": 1, "other": 2, "paper_source": 3}
+
+
 def scan_repo_for_values(root: Path, claims: list[dict]) -> dict[str, list[dict]]:
-    """Grep the working tree for every claimed value. Returns claim id -> hit list."""
+    """Grep the working tree for every claimed value. Returns claim id -> hit list.
+
+    Each list keeps at most MAX_EVIDENCE_FILES hits, data files first, then scripts,
+    then other files, then the paper source; path order within a kind.
+    """
     compiled = [(c["id"], value_patterns(str(c.get("value", "")))) for c in claims]
     hits: dict[str, list[dict]] = {cid: [] for cid, _ in compiled}
 
@@ -334,12 +344,13 @@ def scan_repo_for_values(root: Path, claims: list[dict]) -> dict[str, list[dict]
         rel = path.relative_to(root)
         kind = classify(rel)
         for cid, patterns in compiled:
-            if len(hits[cid]) >= MAX_EVIDENCE_FILES:
-                continue
             if any(p.search(text) for p in patterns):
                 hits[cid].append({"path": str(rel), "kind": kind})
 
-    return hits
+    return {
+        cid: sorted(found, key=lambda h: EVIDENCE_KIND_RANK[h["kind"]])[:MAX_EVIDENCE_FILES]
+        for cid, found in hits.items()
+    }
 
 
 # ---------------------------------------------------------------------------

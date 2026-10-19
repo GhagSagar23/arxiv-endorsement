@@ -98,6 +98,16 @@ def test_scan_finds_values_and_ignores_git(fake_repo: Path):
     assert hits["C3"] == []
 
 
+def test_scan_keeps_data_files_when_a_common_value_is_everywhere(tmp_path: Path):
+    for i in range(check_repo.MAX_EVIDENCE_FILES + 2):
+        (tmp_path / f"a_doc{i}.md").write_text("we ran 30 scenarios\n")
+    (tmp_path / "b_run.py").write_text("N = 30\n")
+    (tmp_path / "z_numbers.csv").write_text("name,value\nHeldOut,30\n")
+    hits = check_repo.scan_repo_for_values(tmp_path, [{"id": "C1", "value": "30"}])["C1"]
+    assert len(hits) == check_repo.MAX_EVIDENCE_FILES
+    assert [h["path"] for h in hits[:2]] == ["z_numbers.csv", "b_run.py"]
+
+
 def test_inventory(fake_repo: Path):
     inv = check_repo.build_inventory(fake_repo)
     paths = {f["path"] for f in inv["files"]}
